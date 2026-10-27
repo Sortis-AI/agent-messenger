@@ -25,6 +25,10 @@ pub enum RelayStatus {
 /// Create a connected client with the given keys and relays.
 pub async fn connect(keys: Keys, relays: &[String]) -> AmResult<Client> {
     let client = Client::new(keys);
+    // NIP-42: answer AUTH challenges and retry `auth-required:` CLOSED/OK
+    // responses. On by default in nostr-sdk 0.44; set explicitly so a future
+    // default change can't silently break AUTH-gated inbox relays.
+    client.automatic_authentication(true);
     for relay in relays {
         client
             .add_relay(relay.as_str())

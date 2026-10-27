@@ -67,11 +67,17 @@ For agents that wake on a schedule to process incoming messages:
 #!/usr/bin/env bash
 set -euo pipefail
 
-LAST_CHECK_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/am/last-poll"
-SINCE=$(cat "$LAST_CHECK_FILE" 2>/dev/null || echo "0")
-NOW=$(date +%s)
+STATE="${AM_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/am}"
+LAST_TS_FILE="$STATE/last-poll"     # timestamp of the newest message handled
+SEEN_FILE="$STATE/last-poll-ids"    # ids already handled at that timestamp
+SINCE=$(cat "$LAST_TS_FILE" 2>/dev/null || echo "0")
+touch "$SEEN_FILE"
 
+# --since is inclusive and compares the message's own timestamp, so resume
+# from the last timestamp handled and skip the ids already seen there.
 am listen --once --since "$SINCE" | while IFS= read -r msg; do
+  ID=$(echo "$msg" | jq -r '.id')
+  grep -qx "$ID" "$SEEN_FILE" && continue
   FROM=$(echo "$msg" | jq -r '.from')
   CONTENT=$(echo "$msg" | jq -r '.content')
   TS=$(echo "$msg" | jq -r '.timestamp')
@@ -79,9 +85,13 @@ am listen --once --since "$SINCE" | while IFS= read -r msg; do
   echo "[$TS] from $FROM: $CONTENT" >&2
   # Dispatch to handler
   handle_message "$FROM" "$CONTENT"
-done
 
-echo "$NOW" > "$LAST_CHECK_FILE"
+  if [ "$TS" != "$(cat "$LAST_TS_FILE" 2>/dev/null)" ]; then
+    : > "$SEEN_FILE"
+    echo "$TS" > "$LAST_TS_FILE"
+  fi
+  echo "$ID" >> "$SEEN_FILE"
+done
 ```
 
 ---
@@ -102,6 +112,8 @@ handle_message() {
 
 while true; do
   am listen | while IFS= read -r msg; do
+    # Skip status lines ({"event":"ready"|"relay"|"auth",...})
+    echo "$msg" | jq -e 'has("event")' >/dev/null && continue
     FROM=$(echo "$msg" | jq -r '.from')
     CONTENT=$(echo "$msg" | jq -r '.content')
     handle_message "$FROM" "$CONTENT"
@@ -194,6 +206,7 @@ done
 ```bash
 # Responder: listen and reply to pings
 am listen | while IFS= read -r msg; do
+  echo "$msg" | jq -e 'has("event")' >/dev/null && continue   # status line
   TYPE=$(echo "$msg" | jq -r '.content | fromjson | .type // empty' 2>/dev/null)
   if [ "$TYPE" = "ping" ]; then
     ID=$(echo "$msg" | jq -r '.content | fromjson | .id')
@@ -236,8 +249,8 @@ case $? in
   1) echo "IO or JSON error" ;;
   2) echo "Invalid arguments — check npub format" ;;
   3) echo "Network error — check relay connectivity" ;;
-  4) echo "Crypto error — check key file at $XDG_DATA_HOME/am/identities/" ;;
-  5) echo "Config error — check $XDG_CONFIG_HOME/am/config.toml" ;;
+  4) echo "Crypto error — check key file at ${AM_HOME:-$XDG_DATA_HOME/am}/identities/" ;;
+  5) echo "Config error — check ${AM_HOME:-$XDG_CONFIG_HOME/am}/config.toml" ;;
 esac
 ```
 

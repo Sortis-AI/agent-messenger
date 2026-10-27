@@ -1,7 +1,7 @@
 ---
 name: agent-messenger
 description: This skill should be used when the user or agent wants to "send a message to another agent", "send a group message", "send an encrypted DM", "check for messages", "listen for incoming messages", "set up am", "configure an identity", "add a relay", "get my npub", "publish a profile", "debug message delivery", "run am-ingest", "configure am-agent", or "set up live monitoring". Provides complete guidance for using the `am` CLI for NIP-17 encrypted agent-to-agent messaging, group chats, profile management, and the am-ingest/am-agent autonomous harness.
-version: 0.3.3
+version: 0.4.0
 ---
 
 # am — Agent Messenger
@@ -60,6 +60,8 @@ am relay add wss://nos.lol
 am relay add wss://relay.nostr.band
 ```
 
+Each `relay add` also publishes the identity's DM relay list (NIP-17 kind 10050) to the configured relays, so clients like Damus, 0xchat and Amethyst deliver gift-wrapped DMs there. Relays are shared across identities but the list is per identity: use `am --identity <name> relay publish` to publish it for another identity, and `--no-publish` to batch adds and publish once. A publish failure (no identity yet, relay down) is reported as `relay_list_error` and does not fail the add.
+
 **3. Verify:**
 
 ```bash
@@ -81,7 +83,24 @@ am send --to <npub> "message content"
 am send --to <npub1> --to <npub2> --to <npub3> "hello group"
 ```
 
-Each recipient receives an individually encrypted copy. The p-tags in the inner rumor identify all participants — clients like 0xchat group messages by this set of tags.
+Each recipient receives an individually encrypted copy of the same inner rumor, so the message `id` is identical for everyone. The rumor's p-tags identify all participants (every recipient plus the sender) — clients like 0xchat group messages by this set of tags.
+
+**Reply to a specific message** (threads it via an `e` tag, per NIP-17):
+
+```bash
+am send --to <npub> --reply-to <id-from-listen> "answer"
+```
+
+Works with `--reply-protocol nip04` too. The recipient sees your message's `reply_to` set to that id.
+
+**Send a file** (NIP-17 kind 15). `am` does not upload or encrypt: encrypt the file yourself (AES-GCM), host it, then pass its URL, key, nonce and SHA-256 of the encrypted bytes:
+
+```bash
+am send --to <npub> --file-url https://host/f.enc --file-type image/jpeg \
+  --decryption-key <key> --decryption-nonce <nonce> --file-hash <sha256-hex>
+```
+
+Optional: `--encryption-algorithm` (default `aes-gcm`), `--file-original-hash`, `--file-size`, `--file-dim WxH`, `--file-blurhash`, `--file-thumbhash`, `--file-thumb <url>`, `--file-fallback <url>` (repeatable). File args can't be combined with a text message or `--reply-protocol nip04` (exit 2).
 
 **Pipe from stdin** (for structured payloads or output of other commands):
 
@@ -89,6 +108,14 @@ Each recipient receives an individually encrypted copy. The p-tags in the inner 
 echo '{"task":"analyze","target":"file.rs"}' | am send --to npub1abc...
 some-command | am send --to npub1abc...
 ```
+
+**Reply to a NIP-04 client** (Primal and other legacy clients send kind-4 DMs; receive them with `am listen --nip04`):
+
+```bash
+am send --to <npub> --reply-protocol nip04 "reply"
+```
+
+Match the `protocol` field of the message you are answering. NIP-04 leaks sender, recipient and timing to relays and supports a single `--to` only, so use it only for interop.
 
 **Use a named identity:**
 
@@ -100,8 +127,11 @@ am send --identity research --to npub1abc... "message from research identity"
 
 ```json
 {
+  "id": "5c3e...",
+  "kind": 14,
   "to": ["npub1...", "npub2..."],
   "content": "hello group",
+  "protocol": "nip17",
   "relays": [
     {"relay": "wss://relay.damus.io", "status": "ok"},
     {"relay": "wss://nos.lol", "status": "ok"}
@@ -109,7 +139,7 @@ am send --identity research --to npub1abc... "message from research identity"
 }
 ```
 
-The `relays` array shows per-relay delivery status. See **Relay Delivery Status** section for details.
+`id` is the message id every recipient's `listen` will report (store it to match replies). The `relays` array shows per-relay delivery status. See **Relay Delivery Status** section for details.
 
 ## Receiving Messages
 
@@ -131,6 +161,8 @@ am listen --once
 am listen --once --since 1700000000
 ```
 
+`--since` compares against each message's own `timestamp` (inclusive), so it is safe to resume with: pass the last `timestamp` you processed and skip any `id` you have already seen.
+
 **Limit number of results:**
 
 ```bash
@@ -140,8 +172,15 @@ am listen --once --limit 10
 Each received message (one JSON object per line):
 
 ```json
-{"from":"npub1xyz...","content":"hello","timestamp":1700000000,"participants":["npub1...","npub1xyz..."]}
+{"id":"5c3e...","from":"npub1xyz...","content":"hello","timestamp":1700000000,"participants":["npub1...","npub1xyz..."],"protocol":"nip17","kind":14,"tags":[["p","..."]],"reply_to":null}
 ```
+
+- `id` — stable message id (dedup key; pass it to `send --reply-to`)
+- `kind` — 14 text, 15 file (then `content` is the file URL and a `file` object carries type, key, nonce and hash), 4 NIP-04
+- `reply_to` — the id this message answers, or `null`
+- `tags` — the raw inner tags, for anything not parsed out
+
+Streaming `am listen` also prints status lines with an `event` key (`ready`, `relay`, `auth`); messages never have one, so skip lines with `event` when you only want messages. If no relay connects, `listen` prints `{"event":"ready","relays":[]}` and exits 3. See `references/output-schemas.md` for every field.
 
 The `participants` array lists all npubs in the conversation (sorted, deduplicated, including sender and self). Use it to identify group conversations and derive a stable conversation ID. For 1:1 DMs it contains two entries; for groups, three or more.
 
@@ -236,9 +275,9 @@ am -v send --to npub1... "test" | jq '.relays[]'
 |------|---------|
 | 0 | Success |
 | 1 | General / IO / JSON error |
-| 2 | Invalid arguments |
+| 2 | Invalid arguments / bad user input (malformed npub or nsec, unknown config key) |
 | 3 | Network / relay error |
-| 4 | Crypto / key error |
+| 4 | Crypto / key error (corrupt stored key, wrong passphrase) |
 | 5 | Config / TOML error |
 
 Always check exit codes in automated workflows:
@@ -268,6 +307,13 @@ am config set format text               # Change default output format
 ```
 
 Config lives at `$XDG_CONFIG_HOME/am/config.toml`. Identities at `$XDG_DATA_HOME/am/identities/<name>.nsec` (0600 permissions).
+
+To isolate state (multiple agents on one machine, tests, sandboxes), set `AM_HOME=<dir>` or pass the global `--home <dir>` flag: config then lives at `<dir>/config.toml` and identities at `<dir>/identities/`. `--home` wins over `AM_HOME`. `am-ingest` and `am-agent` also honor `AM_HOME` (`<dir>/messages.db`, `<dir>/am-agent.toml`).
+
+```bash
+export AM_HOME=~/agents/alice
+am identity generate        # -> ~/agents/alice/identities/default.nsec
+```
 
 ## Privacy Guarantees
 
@@ -305,7 +351,7 @@ am-agent --once    # process pending and exit
 am-agent           # poll continuously (default: 30s interval)
 ```
 
-**Agent config** (`$XDG_CONFIG_HOME/am/am-agent.toml`):
+**Agent config** (`$XDG_CONFIG_HOME/am/am-agent.toml`, or `$AM_HOME/am-agent.toml`):
 
 ```toml
 [agent]

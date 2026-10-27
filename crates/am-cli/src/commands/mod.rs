@@ -43,6 +43,11 @@ pub struct Cli {
     #[arg(long, env = "AM_PASSPHRASE", global = true)]
     pub passphrase: Option<String>,
 
+    /// Directory for all am state (config.toml + identities/), overriding
+    /// the platform data/config dirs
+    #[arg(long, env = "AM_HOME", global = true, value_name = "DIR")]
+    pub home: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -54,7 +59,7 @@ pub enum Commands {
     Identity(identity::IdentityCmd),
 
     /// Send an encrypted message
-    Send(send::SendArgs),
+    Send(Box<send::SendArgs>),
 
     /// Listen for incoming messages
     Listen(listen::ListenArgs),
@@ -76,6 +81,10 @@ pub enum Commands {
 }
 
 pub async fn run(cli: Cli) -> AmResult<()> {
+    if let Some(home) = cli.home.as_deref().filter(|p| !p.as_os_str().is_empty()) {
+        am_core::config::set_home(home);
+    }
+
     let no_dna = std::env::var("NO_DNA").is_ok_and(|v| !v.is_empty());
 
     let mut format = match cli.format {
@@ -96,10 +105,10 @@ pub async fn run(cli: Cli) -> AmResult<()> {
 
     match cli.command {
         Commands::Identity(cmd) => identity::run(cmd, passphrase, format).await,
-        Commands::Send(args) => send::run(args, id, passphrase, format, verbosity).await,
+        Commands::Send(args) => send::run(*args, id, passphrase, format, verbosity).await,
         Commands::Listen(args) => listen::run(args, id, passphrase, format, verbosity).await,
         Commands::Profile(cmd) => profile::run(cmd, id, passphrase, format, verbosity).await,
-        Commands::Relay(cmd) => relay::run(cmd, format).await,
+        Commands::Relay(cmd) => relay::run(cmd, id, passphrase, format, verbosity).await,
         Commands::Config(cmd) => config::run(cmd, format).await,
         Commands::Skill => {
             skill::print_instructions(format);

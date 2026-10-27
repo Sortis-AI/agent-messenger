@@ -96,7 +96,17 @@ fn default_identity() -> String {
     "default".to_string()
 }
 
+/// `$AM_HOME` if set (matching the `am` CLI), else `<platform dir>/am`.
+fn am_home() -> Option<PathBuf> {
+    std::env::var_os("AM_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
 fn default_db_path() -> PathBuf {
+    if let Some(home) = am_home() {
+        return home.join("messages.db");
+    }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("am")
@@ -104,6 +114,9 @@ fn default_db_path() -> PathBuf {
 }
 
 fn default_config_path() -> PathBuf {
+    if let Some(home) = am_home() {
+        return home.join("am-agent.toml");
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("am")

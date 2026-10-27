@@ -37,7 +37,7 @@ pub async fn run(cmd: ConfigCmd, format: Format) -> AmResult<()> {
                 "default_identity" => cfg.default_identity = Some(value.clone()),
                 "format" => cfg.format = Some(value.clone()),
                 _ => {
-                    return Err(am_core::error::AmError::Config(format!(
+                    return Err(am_core::error::AmError::Args(format!(
                         "unknown config key: {key}"
                     )));
                 }

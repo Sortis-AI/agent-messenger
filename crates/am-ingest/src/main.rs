@@ -28,9 +28,39 @@ struct ReceivedMessage {
     content: String,
     timestamp: u64,
     participants: Vec<String>,
+    /// Rumor id (NIP-17) / event id (NIP-04). Absent from older `am` builds.
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// One stdout line of `am listen`.
+#[derive(Debug)]
+enum ListenLine {
+    Message(ReceivedMessage),
+    /// A status line (`{"event": "ready" | "relay" | "auth", ...}`), not a message
+    Event(String),
+}
+
+fn parse_line(line: &str) -> serde_json::Result<ListenLine> {
+    let value: serde_json::Value = serde_json::from_str(line)?;
+    if let Some(event) = value.get("event") {
+        let name = event.as_str().unwrap_or_default().to_string();
+        return Ok(ListenLine::Event(name));
+    }
+    serde_json::from_value(value).map(ListenLine::Message)
+}
+
+/// `$AM_HOME` if set (matching the `am` CLI), else `<platform dir>/am`.
+fn am_home() -> Option<PathBuf> {
+    std::env::var_os("AM_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn default_db_path() -> PathBuf {
+    if let Some(home) = am_home() {
+        return home.join("messages.db");
+    }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("am")
@@ -63,7 +93,21 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             last_message  INTEGER NOT NULL DEFAULT 0,
             metadata      TEXT
         );",
-    )
+    )?;
+    migrate_rumor_id(conn)
+}
+
+/// Add the nullable `rumor_id` column to databases created before it existed.
+/// `message_id` stays the dedup key: existing rows were keyed by it, and
+/// re-keying would re-ingest history as unprocessed.
+fn migrate_rumor_id(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'rumor_id'")?
+        .exists([])?;
+    if !has_column {
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN rumor_id TEXT;")?;
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_rumor_id ON messages(rumor_id);")
 }
 
 fn derive_conv_id(participants: &[String]) -> String {
@@ -89,10 +133,18 @@ fn insert_message(conn: &Connection, msg: &ReceivedMessage) -> rusqlite::Result<
     let ts = msg.timestamp as i64;
 
     let inserted = conn.execute(
-        "INSERT OR IGNORE INTO messages (message_id, conv_id, sender, content, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![message_id, conv_id, msg.from, msg.content, ts],
+        "INSERT OR IGNORE INTO messages (message_id, conv_id, sender, content, timestamp, rumor_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![message_id, conv_id, msg.from, msg.content, ts, msg.id],
     )?;
+
+    if inserted == 0 && msg.id.is_some() {
+        // Backfill rows ingested before `am listen` reported ids.
+        conn.execute(
+            "UPDATE messages SET rumor_id = ?1 WHERE message_id = ?2 AND rumor_id IS NULL",
+            rusqlite::params![msg.id, message_id],
+        )?;
+    }
 
     if inserted > 0 {
         let participants_json = serde_json::to_string(&msg.participants).unwrap_or_default();
@@ -147,8 +199,11 @@ async fn run_ingest(db_path: &PathBuf, identity: &str) -> Result<(), Box<dyn std
                             if line.trim().is_empty() {
                                 continue;
                             }
-                            match serde_json::from_str::<ReceivedMessage>(&line) {
-                                Ok(msg) => {
+                            match parse_line(&line) {
+                                Ok(ListenLine::Event(name)) => {
+                                    tracing::debug!("am listen status line ({name}): {line}");
+                                }
+                                Ok(ListenLine::Message(msg)) => {
                                     received_any = true;
                                     match insert_message(&conn, &msg) {
                                         Ok(true) => {
@@ -285,6 +340,96 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_line_skips_event_lines() {
+        for line in [
+            r#"{"event":"ready","relays":["wss://nos.lol"]}"#,
+            r#"{"event":"relay","relay":"wss://nos.lol","status":"disconnected"}"#,
+            r#"{"event":"auth","relay":"wss://nos.lol","status":"ok"}"#,
+        ] {
+            assert!(matches!(parse_line(line).unwrap(), ListenLine::Event(_)));
+        }
+    }
+
+    #[test]
+    fn test_parse_line_message_with_new_fields() {
+        let line = r#"{"id":"ab12","from":"npub1abc","content":"https://x/f","timestamp":1000,"participants":["npub1abc","npub1def"],"protocol":"nip17","kind":15,"tags":[["p","00"],["x","ff"]],"reply_to":null,"file":{"url":"https://x/f","file_type":"image/png"}}"#;
+        match parse_line(line).unwrap() {
+            ListenLine::Message(msg) => {
+                assert_eq!(msg.id.as_deref(), Some("ab12"));
+                assert_eq!(msg.content, "https://x/f");
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_line_legacy_message_without_id() {
+        let line =
+            r#"{"from":"npub1abc","content":"hi","timestamp":1,"participants":["npub1abc"]}"#;
+        match parse_line(line).unwrap() {
+            ListenLine::Message(msg) => assert!(msg.id.is_none()),
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_line_malformed() {
+        assert!(parse_line(r#"{"bad": true}"#).is_err());
+        assert!(parse_line("not json").is_err());
+    }
+
+    #[test]
+    fn test_migrate_legacy_db_adds_rumor_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Schema as created by earlier am-ingest versions, with a row in it.
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY, message_id TEXT UNIQUE NOT NULL,
+                conv_id TEXT NOT NULL, sender TEXT NOT NULL, content TEXT NOT NULL,
+                timestamp INTEGER NOT NULL, processed INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()));
+             INSERT INTO messages (message_id, conv_id, sender, content, timestamp, processed)
+                VALUES ('old', 'c', 'npub1abc', 'hello', 1000, 1);",
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap(); // idempotent on a migrated DB
+
+        let old: Option<String> = conn
+            .query_row(
+                "SELECT rumor_id FROM messages WHERE message_id = 'old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(old.is_none());
+    }
+
+    #[test]
+    fn test_insert_stores_and_backfills_rumor_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut msg = ReceivedMessage {
+            from: "npub1abc".to_string(),
+            content: "hello".to_string(),
+            timestamp: 1000,
+            participants: vec!["npub1abc".to_string(), "npub1def".to_string()],
+            id: None,
+        };
+        assert!(insert_message(&conn, &msg).unwrap());
+        // Same message again, now with an id: still a duplicate, id backfilled.
+        msg.id = Some("deadbeef".to_string());
+        assert!(!insert_message(&conn, &msg).unwrap());
+        let (count, rumor_id): (i64, Option<String>) = conn
+            .query_row("SELECT COUNT(*), MAX(rumor_id) FROM messages", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rumor_id.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
     fn test_ndjson_parsing_empty() {
         assert!(serde_json::from_str::<ReceivedMessage>("").is_err());
     }
@@ -321,6 +466,7 @@ mod tests {
             content: "hello".to_string(),
             timestamp: 1000,
             participants: vec!["npub1abc".to_string(), "npub1def".to_string()],
+            id: None,
         };
 
         assert!(insert_message(&conn, &msg).unwrap());
@@ -341,6 +487,7 @@ mod tests {
             content: "hello".to_string(),
             timestamp: 1000,
             participants: vec!["npub1abc".to_string(), "npub1def".to_string()],
+            id: None,
         };
 
         assert!(insert_message(&conn, &msg).unwrap());
@@ -357,6 +504,7 @@ mod tests {
             content: "hello".to_string(),
             timestamp: 1000,
             participants: vec!["npub1abc".to_string(), "npub1def".to_string()],
+            id: None,
         };
 
         insert_message(&conn, &msg).unwrap();
@@ -383,6 +531,7 @@ mod tests {
                 "npub1def".to_string(),
                 "npub1ghi".to_string(),
             ],
+            id: None,
         };
 
         insert_message(&conn, &msg).unwrap();
@@ -405,12 +554,14 @@ mod tests {
             content: "hello".to_string(),
             timestamp: 1000,
             participants: vec!["npub1abc".to_string(), "npub1def".to_string()],
+            id: None,
         };
         let msg2 = ReceivedMessage {
             from: "npub1def".to_string(),
             content: "world".to_string(),
             timestamp: 1001,
             participants: vec!["npub1abc".to_string(), "npub1def".to_string()],
+            id: None,
         };
 
         insert_message(&conn, &msg1).unwrap();
@@ -437,12 +588,14 @@ mod tests {
             content: "hello".to_string(),
             timestamp: 1000,
             participants: vec!["npub1abc".to_string(), "npub1def".to_string()],
+            id: None,
         };
         let msg2 = ReceivedMessage {
             from: "npub1def".to_string(),
             content: "world".to_string(),
             timestamp: 2000,
             participants: vec!["npub1abc".to_string(), "npub1def".to_string()],
+            id: None,
         };
 
         insert_message(&conn, &msg1).unwrap();

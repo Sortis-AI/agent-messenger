@@ -29,7 +29,10 @@ pub fn generate(name: Option<&str>, passphrase: Option<&str>) -> AmResult<Identi
 }
 
 pub fn import(nsec: &str, name: Option<&str>, passphrase: Option<&str>) -> AmResult<IdentityInfo> {
-    let secret_key = SecretKey::from_bech32(nsec).map_err(|e| AmError::Crypto(e.to_string()))?;
+    // User-supplied input: a malformed nsec is an argument error (exit 2),
+    // not a crypto failure.
+    let secret_key =
+        SecretKey::from_bech32(nsec).map_err(|e| AmError::Args(format!("invalid nsec: {e}")))?;
     let keys = Keys::new(secret_key);
     let name = name.unwrap_or("default").to_string();
     store_keys(&name, &keys, passphrase)?;

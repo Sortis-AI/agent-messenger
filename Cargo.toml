@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/am-core", "crates/am-cli", "crates/am-ingest", "crates/am-agent"]
 
 [workspace.package]
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.85"
@@ -11,8 +11,8 @@ repository = "https://github.com/Sortis-AI/agent-messenger"
 homepage = "https://github.com/Sortis-AI/agent-messenger"
 
 [workspace.dependencies]
-am-core = { path = "crates/am-core", version = "0.3.3" }
-nostr-sdk = { version = "0.44", features = ["nip49", "nip59"] }
+am-core = { path = "crates/am-core", version = "0.4.0" }
+nostr-sdk = { version = "0.44", features = ["nip04", "nip49", "nip59"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }

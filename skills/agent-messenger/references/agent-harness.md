@@ -33,16 +33,19 @@ am-ingest [--db <path>] [--identity <name>]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db` | `$XDG_DATA_HOME/am/messages.db` | SQLite database path |
+| `--db` | `$AM_HOME/messages.db` if set, else `$XDG_DATA_HOME/am/messages.db` | SQLite database path |
 | `--identity` | `default` | Which am identity to listen as |
 
 ### Behavior
 
 - Creates database with WAL mode on first run
 - Derives `conversation_id` from SHA-256 of sorted participant npubs joined by comma (deterministic, stable)
-- Derives `message_id` from SHA-256 of (sender + timestamp + content) for deduplication
+- Derives `message_id` from SHA-256 of (sender + timestamp + content) for deduplication. This stays the dedup key: databases already hold these ids, and re-keying would re-ingest history as unprocessed
+- Stores the `id` from `am listen` (NIP-17 rumor id / NIP-04 event id) in the nullable `rumor_id` column. Databases created before this column existed are migrated on startup (`ALTER TABLE ... ADD COLUMN`); old rows keep `rumor_id = NULL` unless the same message is seen again, which backfills it
+- Skips `am listen` status lines (any line with an `event` key: `ready`, `relay`, `auth`) with a debug log; only lines that are neither messages nor status lines are logged as "malformed NDJSON line"
+- Runs `am listen` without `--since`, so each restart re-reads what relays still hold; dedup by `message_id` makes that harmless
 - Classifies conversations as `dm` (2 participants) or `group` (3+)
-- On network error (exit code 3): reconnects with exponential backoff (1s → 2s → 4s → ... max 60s)
+- On network error (exit code 3) — including `am listen` finding no connected relay at startup — reconnects with exponential backoff (1s → 2s → 4s → ... max 60s)
 - On other errors: exits immediately
 
 ### SQLite Schema
@@ -51,14 +54,15 @@ am-ingest [--db <path>] [--identity <name>]
 
 ```sql
 CREATE TABLE messages (
-    message_id   TEXT PRIMARY KEY,       -- SHA-256(from + timestamp + content)
-    conv_id      TEXT NOT NULL,          -- SHA-256(sorted participants)
-    from_npub    TEXT NOT NULL,          -- sender npub
-    content      TEXT NOT NULL,          -- decrypted message
-    timestamp    INTEGER NOT NULL,       -- Unix timestamp
-    participants TEXT NOT NULL,          -- JSON array of npubs
-    processed    INTEGER DEFAULT 0,      -- 0 = pending, 1 = processed by am-agent
-    inserted_at  TEXT DEFAULT (datetime('now'))
+    id          INTEGER PRIMARY KEY,
+    message_id  TEXT UNIQUE NOT NULL,    -- SHA-256(from + timestamp + content); the dedup key
+    conv_id     TEXT NOT NULL,           -- SHA-256(sorted participants)
+    sender      TEXT NOT NULL,           -- sender npub
+    content     TEXT NOT NULL,           -- decrypted message (the file URL for kind-15 file messages)
+    timestamp   INTEGER NOT NULL,        -- the message's own Unix timestamp
+    processed   INTEGER NOT NULL DEFAULT 0, -- 0 = pending, 1 = processed by am-agent
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    rumor_id    TEXT                     -- `id` from am listen (NIP-17 rumor id); NULL for rows ingested before it existed
 );
 ```
 
@@ -67,10 +71,10 @@ CREATE TABLE messages (
 ```sql
 CREATE TABLE conversations (
     conv_id       TEXT PRIMARY KEY,
-    conv_type     TEXT NOT NULL,          -- "dm" or "group"
     participants  TEXT NOT NULL,          -- JSON array of npubs
-    last_message  INTEGER NOT NULL,       -- Unix timestamp of latest message
-    metadata      TEXT DEFAULT '{}'       -- JSON: summary, agent state, etc.
+    conv_type     TEXT NOT NULL,          -- "dm" or "group"
+    last_message  INTEGER NOT NULL DEFAULT 0, -- Unix timestamp of latest message
+    metadata      TEXT                    -- conversation summary (NULL until the first reply)
 );
 ```
 
@@ -102,8 +106,8 @@ am-agent [--config <path>] [--db <path>] [--interval <seconds>] [--once]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config` | `$XDG_CONFIG_HOME/am/am-agent.toml` | TOML config file |
-| `--db` | `$XDG_DATA_HOME/am/messages.db` | Override database path |
+| `--config` | `$AM_HOME/am-agent.toml` if set, else `$XDG_CONFIG_HOME/am/am-agent.toml` | TOML config file |
+| `--db` | `$AM_HOME/messages.db` if set, else `$XDG_DATA_HOME/am/messages.db` | Override database path |
 | `--interval` | 30 | Poll interval in seconds |
 | `--once` | false | Process pending messages and exit |
 
@@ -119,7 +123,7 @@ stdin = true                         # If true, pipe prompt via stdin (not arg r
 env = { "OLLAMA_HOST" = "localhost" } # Extra environment variables for agent process
 
 [general]
-db = ""                              # Database path (empty = default XDG location)
+db = ""                              # Database path (empty = $AM_HOME or default XDG location)
 interval = 30                        # Poll interval in seconds
 identity = "default"                 # am identity for sending replies
 system_prompt = "persona.md"         # Path to system prompt file (optional)

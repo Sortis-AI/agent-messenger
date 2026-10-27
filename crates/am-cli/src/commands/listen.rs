@@ -6,11 +6,12 @@ use am_core::{message, output};
 
 #[derive(Debug, Args)]
 pub struct ListenArgs {
-    /// Unix timestamp to fetch messages since
+    /// Only messages whose own timestamp is >= this Unix time (inclusive).
+    /// Resume by passing the last `timestamp` you saw and dedup by `id`
     #[arg(long)]
     pub since: Option<u64>,
 
-    /// Maximum number of messages to fetch
+    /// Maximum number of messages to fetch (the newest are kept)
     #[arg(long)]
     pub limit: Option<usize>,
 
@@ -21,6 +22,10 @@ pub struct ListenArgs {
     /// Timeout in seconds for --once mode
     #[arg(long, default_value = "30")]
     pub timeout: u64,
+
+    /// Also receive legacy NIP-04 (kind 4) DMs. Off by default: weaker privacy
+    #[arg(long)]
+    pub nip04: bool,
 }
 
 pub async fn run(
@@ -36,6 +41,7 @@ pub async fn run(
         args.limit,
         args.once,
         args.timeout,
+        args.nip04,
         passphrase,
         verbosity,
     )

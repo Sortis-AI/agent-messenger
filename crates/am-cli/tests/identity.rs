@@ -6,6 +6,7 @@ fn am_cmd(data_dir: &TempDir, config_dir: &TempDir) -> Command {
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("am");
     cmd.env("XDG_DATA_HOME", data_dir.path());
     cmd.env("XDG_CONFIG_HOME", config_dir.path());
+    cmd.env_remove("AM_HOME");
     cmd
 }
 
@@ -148,4 +149,15 @@ fn duplicate_identity_fails() {
         .args(["identity", "generate", "--name", "dup"])
         .assert()
         .failure();
+}
+
+#[test]
+fn import_invalid_nsec_exits_args() {
+    let data = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+
+    am_cmd(&data, &config)
+        .args(["identity", "import", "not-an-nsec"])
+        .assert()
+        .code(2);
 }

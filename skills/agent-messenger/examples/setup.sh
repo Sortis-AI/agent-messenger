@@ -29,13 +29,17 @@ add_relay_if_missing() {
   if am relay list | jq -e --arg u "$url" '.[] | select(.url == $u)' >/dev/null 2>&1; then
     echo "Relay already configured: $url" >&2
   else
-    am relay add "$url"
+    am relay add --no-publish "$url" >/dev/null
     echo "Added relay: $url" >&2
   fi
 }
 
 add_relay_if_missing "wss://relay.damus.io"
 add_relay_if_missing "wss://nos.lol"
+
+# Publish the DM relay list (NIP-17 kind 10050) for this identity so clients
+# like Damus, 0xchat and Amethyst know where to deliver its DMs
+am --identity "$IDENTITY" relay publish >/dev/null && echo "Published DM relay list." >&2
 
 echo "" >&2
 echo "=== Setup complete ===" >&2
